@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+# shot — снимки экрана под niri без установки лишнего.
+#
+# Ничего ставить не нужно: grim и slurp уже есть. Не хватало только
+# обвязки — каталога для папок, превью и подписи времени.
+#
+#   shot s             снимок всего экрана
+#   shot r             снимок области — выделяешь мышью
+#   shot w             снимок активного окна (см. «Что не работает»)
+#   shot d МОНИТОР     снимок одного монитора: shot d HDMI-A-1
+#   shot d             список мониторов
+#   shot p             просто скопировать снимок в буфер обмена
+#   shot t [секунды]   снимок с таймером, по умолчанию 3
+#   shot last          показать путь последнего снимка
+#   shot open [каталог]  открыть папку со снимками
+#
+# Всё складывается в ~/Pictures/Screenshots/<год>/, рядом уменьшенная
+# копия и подпись времени в углу.
+#
+# Что не работает на этой машине: shot w. niri 26.04 не отдаёт снимок
+# отдельного окна — grim -T требует ext-image-capture, которого нет.
+# Весь экран (shot s), область (shot r) и монитор (shot d) работают.
+
+set -Eeuo pipefail
+
+DIR="$HOME/Pictures/Screenshots"
+CLI_NAME="shot"
+
+die() { printf '%s: %s\n' "$CLI_NAME" "$*" >&2; exit 1; }
+note() { printf '%s: %s\n' "$CLI_NAME" "$*" >&2; }
+
+for c in grim slurp; do
+    command -v "$c" >/dev/null 2>&1 || die "$c не найден (пакет grim, slurp)"
+done
+
+usage() {
+    sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+ensure_dirs() {
+    mkdir -p "$DIR/$(date +%Y)"
+    chmod 700 "$DIR" 2>/dev/null || true
+}
+
+# Имя файла: год/метка с датой. Пробелы в имени не мешают, но
+# для скриптов приятнее без них — так и делаем.
+stamp() { date +"%Y-%m-%d_%H-%M-%S"; }
+
+# Имя файла. Вид входит в имя всегда, а для монитора добавляется его
+# порт — иначе два снимка разных мониторов в одну секунду получили бы
+# одно имя и второй затёрл бы первый.
+pick_name() {
+    local kind="$1" suffix="${2:-}"
+    if [ -n "$suffix" ]; then
+        suffix="-$(printf '%s' "$suffix" | tr -c '[:alnum:]._-' '_' | cut -c1-24)"
+    else
+        suffix=""
+    fi
+    printf '%s/%s/%s-%s%s.png' "$DIR" "$(date +%Y)" "$(stamp)" "$kind" "$suffix"
+}
+
+notify() {
+    command -v notify-send >/dev/null 2>&1 && \
+        notify-send -a "Скриншот" "$1" "$2" 2>/dev/null || true
+}
+
+# Копирует в буфер. wl-copy может не быть — это не повод падать.
+to_clipboard() {
+    if command -v wl-copy >/dev/null 2>&1; then
+        # Файлы дескрипторов перенаправляем в /dev/null: wl-copy остаётся
+        # жить, удерживая буфер обмена, и если он унаследует наш stdout,
+        # вызывающая сторона (например $(...) в цикле) будет ждать EOF
+        # вечно. Именно из-за этого первый вариант скрипта подвисал.
+        wl-copy -t image/png < "$1" >/dev/null 2>&1 && return 0
+    fi
+    return 1
+}
+
+# Превью: уменьшенная копия, если imagemagick/ffmpeg нашлись.
+make_preview() {
+    local src="$1" dst="${1%.png}_small.png"
+    if command -v magick >/dev/null 2>&1; then
+        magick "$src" -resize '400x>' "$dst" 2>/dev/null && return 0
+    elif command -v convert >/dev/null 2>&1; then
+        convert "$src" -resize '400x>' "$dst" 2>/dev/null && return 0
+    elif command -v ffmpeg >/dev/null 2>&1; then
+        ffmpeg -loglevel error -y -i "$src" -vf 'scale=400:-1' "$dst" 2>/dev/null && return 0
+    fi
+    return 1
+}
+
+# Подпись времени в углу — только если ffmpeg нашёлся.
+stamp_image() {
+    local src="$1"
+    command -v ffmpeg >/dev/null 2>&1 || return 1
+    local tmp="$src.tmp.png"
+    local text
+    text="$(date +'%d.%m.%Y %H:%M')"
+    ffmpeg -loglevel error -y -i "$src" \
+        -vf "drawtext=text='$text':x=w-tw-24:y=h-th-24:fontsize=28:fontcolor=white@0.75:box=1:boxcolor=black@0.45:boxborderw=8" \
+        "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$src"
+}
+
+# Мониторы и их геометрия. У grim нет ни -l, ни -d — список выходов и
+# их координаты знает только niri, поэтому строим область сами и снимаем
+# через grim -g. Формат niri: имя в строке Output, позиция и размер
+# отдельными строками «Logical position:» и «Logical size:».
+outputs_raw() {
+    niri msg outputs 2>/dev/null | python3 -c '
+import sys, re
+cur = {}
+out = []
+for line in sys.stdin:
+    line = line.rstrip("\n")
+    m = re.match(r"^Output \"(.+?)\" \((.+)\)$", line)
+    if m:
+        if cur.get("w"):
+            out.append(cur)
+        cur = {"name": m.group(1), "port": m.group(2)}
+        continue
+    m = re.match(r"^\s*Logical size:\s*(\d+)x(\d+)\s*$", line)
+    if m and cur:
+        cur["w"], cur["h"] = m.group(1), m.group(2)
+        continue
+    m = re.match(r"^\s*Logical position:\s*(-?\d+),\s*(-?\d+)\s*$", line)
+    if m and cur:
+        # position идёт ПЕРЕД size, поэтому дописываем на следующем
+        # Output или в конце — иначе размер ещё не прочитан.
+        cur["x"], cur["y"] = m.group(1), m.group(2)
+        continue
+if cur.get("w"):
+    out.append(cur)
+for o in out:
+    if "w" in o:
+        print("\t".join([o["name"], o["port"], o["w"] + "x" + o["h"],
+                         o.get("x", "0") + "," + o.get("y", "0")]))
+'
+}
+
+# Для человека: «Имя (порт)  1280x1024 @ 3440,0»
+list_outputs() {
+    outputs_raw | awk -F'\t' '{printf "%s (%s)  %s @ %s\n", $1, $2, $3, $4}'
+}
+
+# Печатает «X,Y ШИРИНАxВЫСОТА» — ровно то, что ждёт grim -g — для
+# первого выхода, чьё имя или порт
+# подходит под запрос. Пустой запрос — весь список и код 2.
+pick_output() {
+    local want="$1" raw
+    raw="$(outputs_raw)"
+    if [ -z "$want" ]; then
+        list_outputs
+        return 2
+    fi
+    local name port
+    while IFS=$'\t' read -r name port size xy; do
+        [ -n "$size" ] || continue
+        case "$name" in
+            *"$want"*) printf '%s %s\n' "$xy" "$size"; return 0 ;;
+        esac
+        if [ "$port" = "$want" ]; then
+            printf '%s %s\n' "$xy" "$size"
+            return 0
+        fi
+    done <<< "$raw"
+    printf 'монитор «%s» не найден. Доступны:\n%s\n' "$want" "$(list_outputs)" >&2
+    return 1
+}
+
+capture() {
+    local geom_args=() out mon err tag=""
+    case "${1:-s}" in
+        s|"") geom_args=() ;;
+        r)   geom_args=(-g "$(slurp)") ;;
+        w)   [ -n "${2:-}" ] || die "нужен id окна"
+            geom_args=(-T "$2") ;;
+        d)   mon="$(pick_output "${2:-}")" || exit $?
+            tag="${2:-}"
+            geom_args=(-g "${mon}") ;;
+        *)   die "не понимаю аргумент: $1" ;;
+    esac
+    out="$(pick_name "${1:-s}" "$tag")"
+    ensure_dirs
+    if ! err="$(grim "${geom_args[@]}" "$out" 2>&1 >/dev/null)" || [ ! -s "$out" ]; then
+        rm -f "$out"
+        # Сообщение grim различаем: «compositor doesn't support» — это
+        # про -T/окно на этой версии niri, а не про KeePassXC.
+        case "$err" in
+            *"doesn't support the screen capture protocol"*)
+                die "niri $(niri --version 2>/dev/null | head -1) не отдаёт снимок окна.
+Весь экран работает: shot s
+Область: shot r
+Причина — grim -T опирается на ext-image-capture, которого в этой версии нет." ;;
+            *)
+                die "grim не смог снять: ${err:-неизвестная ошибка}" ;;
+        esac
+    fi
+    printf '%s\n' "$out"
+}
+
+act() {
+    local kind="$1"; shift
+    local out
+    out="$(capture "$kind" "$@" | tail -1)"
+    if [ ! -s "$out" ]; then
+        die "файл не создан или пуст: $out"
+    fi
+    stamp_image "$out" || true
+    make_preview "$out" || true
+    local base msg
+    base="$(basename "$out")"
+    msg="снимок: $base"
+    if to_clipboard "$out"; then
+        msg="$msg, продублирован в буфер"
+    fi
+    note "$msg"
+    notify "Снимок готов" "$base"
+}
+
+cmd_last() {
+    local last
+    last="$(find "$DIR" -name '*.png' ! -name '*_small.png' -type f 2>/dev/null \
+            | sort | tail -1)"
+    [ -n "$last" ] || die "снимков пока нет"
+    printf '%s\n' "$last"
+}
+
+cmd_open() {
+    local d="${1:-$DIR}"
+    if command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "$d" >/dev/null 2>&1 && exit 0
+    fi
+    if command -v niri >/dev/null 2>&1; then
+        niri msg action spawn -- "footclient" "$d" 2>/dev/null && exit 0
+    fi
+    printf '%s\n' "$d"
+}
+
+case "${1:-}" in
+    s|"")   act s ;;
+    r)      act r ;;
+    # niri msg focused-window печатает «Window ID 7: (focused)» —
+    # JSON-режима у этой версии нет, поэтому id вытаскиваем строкой.
+    w)      win="$(niri msg focused-window 2>/dev/null \
+                   | sed -n 's/^Window ID \([0-9]\+\).*/\1/p' | head -1)"
+           [ -n "$win" ] || die "niri не назвал активное окно"
+           act w "$win" ;;
+    d)      if [ $# -lt 2 ]; then
+               list_outputs
+               die "укажи монитор: shot d HDMI-A-1   (список выше)"
+           fi
+           act d "$2" ;;
+    p)      out="$(capture s | tail -1)"
+           if to_clipboard "$out"; then
+               note "в буфере: $(basename "$out")"
+           else
+               die "нет wl-copy — скопировать нечем"
+           fi ;;
+    t)      sleep "${2:-3}"; act s ;;
+    last)   cmd_last ;;
+    open)   cmd_open "${2:-}" ;;
+    -h|--help|help) usage ;;
+    *)      die "неизвестная команда: $1. Список — $CLI_NAME --help" ;;
+esac
